@@ -44,6 +44,72 @@ CREATE TABLE IF NOT EXISTS dnd_characters (
 );
 """)
 
+#Stores 0 for no proficiency, 1 for proficiency, 2 for expertise
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS proficiencies (
+  character_id INTEGER,
+  str_save INTEGER,
+  dex_save INTEGER,
+  con_save INTEGER,
+  int_save INTEGER,
+  wis_save INTEGER,
+  cha_save INTEGER,
+  acrobatics INTEGER,
+  animal_handling INTEGER,
+  arcana INTEGER,
+  athletics INTEGER,
+  deception INTEGER,
+  history INTEGER,
+  insight INTEGER,
+  intimidation INTEGER,
+  investigation INTEGER,
+  medicine INTEGER,
+  nature INTEGER,
+  perception INTEGER,
+  performance INTEGER,
+  persuasion INTEGER,
+  religion INTEGER,
+  sleight_of_hand INTEGER,
+  stealth INTEGER,
+  survival INTEGER
+);
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS spell_slots(
+  character_id INTEGER,
+  lvl_1 INTEGER,
+  lvl_2 INTEGER,
+  lvl_3 INTEGER,
+  lvl_4 INTEGER,
+  lvl_5 INTEGER,
+  lvl_6 INTEGER,
+  lvl_7 INTEGER,
+  lvl_8 INTEGER,
+  lvl_9 INTEGER
+);
+""")
+
+#0 indicates not that class, other numbers indicate lvl in that class to support multiclassing
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS classes(
+  character_id INTEGER,
+  barbarian INTEGER,
+  bard INTEGER,
+  cleric INTEGER,
+  druid INTEGER,
+  fighter INTEGER,
+  monk INTEGER,
+  paladin INTEGER,
+  ranger INTEGER,
+  rogue INTEGER,
+  sorcerer INTEGER,
+  warlock INTEGER,
+  wizard INTEGER,
+  artificer INTEGER
+);
+""")
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS equipment_catalog (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
