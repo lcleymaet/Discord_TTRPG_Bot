@@ -4,7 +4,7 @@ A bot made to store and assist with playing TTRPG's through Discord. Currently i
 ## Current functionality:
 - Roll dice! This command allows anybody in a server where this bot lives to roll dice using NdM notation. Supports up to 50 dice at a time to prevent spam.
 - Play a slot machine - Permits a player to play a slot machine-esque game from the discord chat. Commands are set up in a tree to guide player to correct functionality
-- Initializes a sqlite database on bot startup if none exists. This is a relational databse that stores user data that can be linked to any number of D&D 5e characters. Future plans to add functionality for players to use the bot to directly roll stat checks and make weapon rolls
+- Initializes a sqlite database on bot startup if none exists. This is a relational databse that stores user data that can be linked to any number of D&D 5e characters. 
 - - Weapons table is initialized and will need to be populated with weapon names and the dice used to roll it. This is functionality planned for far future
 
 ## Future plans
@@ -13,3 +13,4 @@ A bot made to store and assist with playing TTRPG's through Discord. Currently i
 - Add weapon roll functionality
 - Conduct tests to tune slot machine game to a certain expected ROI over time
 - Add class resource tracking (spell slots, action surge, sorcery points etc)
+- Add subclass support outside of what is in player's handbook (and Tasha's for artificer class)
