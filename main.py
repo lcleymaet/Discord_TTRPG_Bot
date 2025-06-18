@@ -11,10 +11,97 @@ import sqlite3 as lite
 import sys
 
 load_dotenv()
+db_path = os.path.join(os.path.dirname(__file__),"characters.db")
+#need to store maximum ID from database on initialization in a local object
+
+#Create classes for caching
+#DnD_Char is a class that contains a single dungeons and dragons 5e character
+#User is a class that contains a User that may contain none or amny characters
+class DnD_Char:
+  #self is char_id from database
+  #stats should be a dictionary with int, cha, wis, str, con, dex as keys
+  #classes is the starting class str
+  #race, name, background are strings
+  def __init__(self, owner, name, race, background, classes, hit_dice, stats, hp, xp = 0, spells = {}, spell_slots = {}, current_points = {}, ac, ms = 30, id, languages = {}, equipment = {}, feats = [], exhaustion = 0):
+    self.name = name
+    self.owner = owner
+    self.race = race
+    self.background = background
+    self.classes = classes
+    self.hit_dice = hit_dice
+    self.xp = xp
+    self.spell_slots = spell_slots #type: [current, max]
+    self.spells = spells #prepared or known, depending on class
+    self.stats = stats
+    self.languages = []
+    self.equipment = {}
+    self.points = current_points #contains things like sorcery points etc - type: [current, max]
+    self.feats = []
+    self.hp = hp #[current, max]
+    self.ac = ac
+    self.ms = ms
+    self.exhaustion = exhaustion
+    self.id = id #placeholder, will be overwritten with next integer for database table
+  def add_lang(lang):
+    self.languages.append(lang)
+  def remove_lang(lang):
+    self.languages.remove(lang)
+  def update_stats(new):
+    for key, val in new.items():
+      self.stats[key] = val
+  def add_equip(thing, amount):
+    if thing not in self.equipment:
+      self.equipment[thing] = amount
+    else:
+      self.equipment[thing] += amount
+  def add_xp(amount):
+    self.xp += amount
+  def add_feat(feat):
+    self.feats.append(feat)
+  def change_ms(new):
+    self.ms = new
+  def level_up(new_class, hp_roll, stat_change = False, stats = {}, feat_add = False, feats = []):
+    #stats is a dictionary of stats that are changing and an amount change
+    if stat_change:
+      for key, val in stats.items():
+        self.stats[key][0] += val
+    if feat_add:
+      for feat in feats:
+        self.feats.append(feat)
+    if new_class in self.classes:
+      self.classes[new_class] += 1
+    else:
+      self.classes[new_class] = 1
+    self.max_hp += (hp_roll + ((self.stats["con"] - 10) // 2))
+  def use_points(type, val):
+    if self.points[type][0] >= val:
+      self.points[type][0] -= val
+  def change_max_points(type, val)
+    self.max_points[type] = val
+  def cast_spell(level):
+    if self.spell_slots[level][0] > 0:
+      self.spell_slots[level][0] -= 1
+  def add_exhaustion(decrease = False):
+    if decrease:
+      self.exhaustion -= 1
+    else:
+      self.exhaustion += 1
+  def long_rest(change_spells = False, spells = []):
+    self.hp[0] = self.hp[1]
+    for key, val in self.spell_slots.items():
+      self.spell_slots[key][0] = val[1] #dictionary is set up with key: list[current,max]
+    for key, val in self.points.items():
+      self.points[key][0] = val[1]
+    if change_spells:
+      self.spells = spells
+    if self.exhaustion > 0:
+      self.exhaustion -= 1
+  
+class User:
+  
 
 #initialize connection to database
 def init_db():
-  db_path = os.path.join(os.path.dirname(__file__),"characters.db")
   conn = lite.connect(db_path)
   cursor = conn.cursor()
 
@@ -28,17 +115,18 @@ def init_db():
 
   cursor.execute("""
   CREATE TABLE IF NOT EXISTS dnd_characters (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     user_id TEXT,
     name TEXT,
     race TEXT,
     move_speed INTEGER,
     level INTEGER,
     languages TEXT,
+    background TEXT,
+    feats TEXT,
     xp INTEGER,
-    health INTEGER,
+    hp INTEGER,
     ac INTEGER,
-    gold INTEGER,
     int INTEGER,
     str INTEGER,
     agi INTEGER,
@@ -46,7 +134,8 @@ def init_db():
     con INTEGER,
     cha INTEGER,
     other_proficiencies TEXT,
-    skills TEXT
+    skills TEXT,
+    exhaustion INTEGER
   );
   """)
 
@@ -310,10 +399,9 @@ def init_db():
     count INTEGER
   );
   """)
-
   conn.commit()
   conn.close()
-    
+
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
