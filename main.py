@@ -26,9 +26,42 @@ max_id_lock = threading.Lock()
 def get_next_id():
   global max_id
   with max_id_lock:
-    val = max_id
     max_id += 1
+    val = max_id
   return val
+
+def init_max_id_from_db(db = db_path):
+  global max_id
+  try:
+    conn = lite.connect(db)
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(id) FROM dnd_characters")
+    row = cursor.fetchone()
+    max_id = (row[0] or 0) + 1
+  except Exception as e:
+    logging.error(f"Failed to initialize max_id from database: {e}")
+  finally:
+    conn.close()
+
+#initialize cache
+dnd_cache = DnD_Cache()
+
+#These are the levels each class gets its subclass
+subclass_levels = {
+  "barbarian": 3,
+  "fighter": 3,
+  "paladin": 3,
+  "ranger": 3,
+  "artificer": 3,
+  "bard": 3,
+  "cleric": 1,
+  "druid": 2,
+  "monk": 3,
+  "rogue": 3,
+  "warlock": 1,
+  "sorcerer": 1,
+  "wizard": 2
+}
 
 #Dictionary to store what hit die each class takes
 class_dice = {
@@ -58,10 +91,10 @@ class DnD_Char:
   __slots__ = (
   "name", "owner", "race", "background", "classes", "subclasses", "hit_dice", "xp",
   "abilities", "spell_slots", "spells", "stats", "languages", "equipment", "points",
-  "feats", "hp", "ac", "ms", "exhaustion", "proficiencies", "Id"
+  "feats", "hp", "ac", "ms", "exhaustion", "proficiencies", "Id", "notes"
   )
   def __init__(self, 
-               owner: str,
+               owner: int,
                name: str,
                race: str,
                background: str,
@@ -79,7 +112,7 @@ class DnD_Char:
                spell_slots: dict = None,
                points: dict = None,
                ms: int = 30,
-               languages: dict = None,
+               languages: list = None,
                equipment: dict = None,
                feats: list = None,
                exhaustion: int = 0,
@@ -87,15 +120,15 @@ class DnD_Char:
     self.name = name
     self.owner = owner
     self.race = race
-    self.notes = notes or []
     self.background = background
     self.classes = classes 
     self.subclasses = subclasses or {}
     self.hit_dice = hit_dice
     self.xp = xp
+    self.notes = notes or []
     self.abilities = abilities or []
     self.spell_slots = spell_slots or {} #type: [current, max]
-    self.spells = spells or {} #prepared or known, depending on class {"known": {level: [spells]}, "prepared": [spells]}
+    self.spells = spells or {} #prepared or known, depending on class {"known": {level: [spells]}, "prepared": {level: [spells]}}
     self.stats = stats
     self.languages = languages or []
     self.equipment = equipment or {}
@@ -107,6 +140,8 @@ class DnD_Char:
     self.exhaustion = exhaustion
     self.proficiencies = proficiencies or {}
     self.Id = Id #placeholder, will be overwritten with next integer for database table
+  def __repr__(self):
+    return f"<DnD_Char {self.name} (ID {self.Id}), Level {self.get_level()}>"
   def add_lang(self, lang):
     self.languages.append(lang)
   def add_ability(self, ability):
@@ -144,7 +179,7 @@ class DnD_Char:
         if "known" not in self.spells:
           self.spells["known"] = {}
         if key not in self.spells["known"]:
-          self.spells["known"][key = []
+          self.spells["known"][key] = []
         self.spells["known"][key].extend(val)
     if feat_add:
       for feat in feats:
@@ -154,10 +189,12 @@ class DnD_Char:
     else:
       self.classes[new_class] = 1
     if new_class.lower() in ["cleric","sorcerer","warlock"] and self.classes[new_class] >= 1 and new_class.lower() not in self.subclasses:
-      self.add_new_subclass(new_class, subclass)
+      self.add_new_subclass(new_class.lower(), subclass)
     elif new_class.lower() not in ["cleric","sorcerer","warlock"] and self.classes[new_class] >= 3 and new_class.lower() not in self.subclasses:
-      self.add_new_subclass(new_class, subclass)
-    self.hp[1] += (hp_roll + ((self.stats["con"] - 10) // 2))
+      self.add_new_subclass(new_class.lower(), subclass)
+    hp_gain = max(1, hp_roll + ((self.stats["con"] - 10) // 2))
+    self.hp[1] += hp_gain
+    self.hp[0] += hp_gain
   def use_points(self, type, val):
     if self.points[type][0] >= val:
       self.points[type][0] -= val
@@ -167,7 +204,7 @@ class DnD_Char:
     else:
       self.points[type] = [val, val]
   def cast_spell(self, level):
-    if self.spell_slots[level][0] > 0:
+    if level in self.spell_slots and self.spell_slots[level][0] > 0:
       self.spell_slots[level][0] -= 1
   def add_exhaustion(self, decrease = False):
     self.exhaustion = max(0, self.exhaustion - 1) if decrease else self.exhaustion + 1
@@ -257,17 +294,17 @@ class DnD_Char:
     cursor.execute("DELETE FROM character_classes WHERE character_id = ?", (self.Id,))
     for cls, level in self.classes.items():
       subclass = self.subclasses.get(cls, "")
-      hd = self.hit_dice.get(cls, "")
       cursor.execute("""
-      INSERT INTO character_classes (character_id, class_name, level, subclass, hit_dice)
-      VALUES (?, ?, ?, ?, ?)
-      """, (self.Id, cls, level, subclass, hd))
+      INSERT INTO character_classes (character_id, class_name, level, subclass)
+      VALUES (?, ?, ?, ?)
+      """, (self.Id, cls, level, subclass))
     cursor.execute("REPLACE INTO spells (character_id, spells) VALUES (?, ?)", 
                    (self.Id, json.dumps(self.spells)))
     cursor.execute("REPLACE INTO spell_slots (character_id, slots) VALUES (?, ?)", 
                    (self.Id, json.dumps(self.spell_slots)))
     cursor.execute("REPLACE INTO proficiencies (character_id, proficiencies) VALUES (?, ?)", 
                    (self.Id, json.dumps(self.proficiencies)))
+    conn.commit()
   @classmethod
   def from_db(cls, conn, character_id):
     cursor = conn.cursor()
@@ -276,15 +313,13 @@ class DnD_Char:
     if not row:
       raise ValueError(f"Character ID {character_id} not found")
 
-    cursor.execute("SELECT class_name, level, subclass, hit_dice FROM character_classes WHERE character_id = ?", (character_id,))
+    cursor.execute("SELECT class_name, level, subclass FROM character_classes WHERE character_id = ?", (character_id,))
     class_rows = cursor.fetchall()
     classes = {}
     subclasses = {}
-    hit_dice = {} #format is {d8: [current, max]}. d# determined by class type, max determined by level
     for r in class_rows:
       classes[r[0]] = r[1]
       subclasses[r[0]] = r[2]
-      hit_dice[r[0]] = r[3] if r[0] not in hit_dice else hit_dice[r[0]] + r[3]
 
     cursor.execute("SELECT spells FROM spells WHERE character_id = ?", (character_id,))
     spells_row = cursor.fetchone()
@@ -304,7 +339,7 @@ class DnD_Char:
               race = row["race"],
               background = row["background"],
               classes = classes,
-              hit_dice = hit_dice,
+              hit_dice = json.loads(row["hit_dice"]) if "hit_dice" in row.keys() else {},
               stats = json.loads(row["stats"]),
               hp = json.loads(row["hp"]),
               ac = row["ac"],
@@ -374,6 +409,13 @@ def update_users_table(cache: DnD_Cache, conn):
         if user_id not in user_char_map:
             user_char_map[user_id] = []
         user_char_map[user_id].append(char.Id)
+    #remove users from table who have no characters
+    cursor.execute("SELECT user_id FROM users")
+    existing_users = {row[0] for row in cursor.fetchall()}
+    current_users = set(user_char_map.keys())
+    stale_users = existing_users - current_users
+    for user_id in stale_users:
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     # Update users table
     for user_id, char_ids in user_char_map.items():
         chars_json = json.dumps(char_ids)
@@ -387,16 +429,18 @@ def update_users_table(cache: DnD_Cache, conn):
           chars = excluded.chars,
           n_chars = excluded.n_chars
         """, (user_id, chars_json, n_chars))
+      conn.commit()
 
 #pushing the dnd character cache to a database
 def push_dnd_cache_to_db(cache: DnD_Cache, db: str):
   if cache.is_empty():
     logging.info("Character cache is empty. Skipping database push.")
+    return
   try:
     conn = lite.connect(db)
     conn.row_factory = lite.Row
 
-    chars = cache.all_characters()
+    chars = list(cache.all_characters())
     logging.info(f"Starting push of {len(chars)} characters to database.")
     
     for character in chars:
@@ -409,26 +453,33 @@ def push_dnd_cache_to_db(cache: DnD_Cache, db: str):
     logging.info("Cache cleared after successful push.")
 
   except Exception as e:
-    conn.rollback()
+    if 'conn' in locals():
+      conn.rollback()
     logging.error(f"Failed to push characters to database: {e}")
   finally:
-    conn.close()
+    if 'conn' in locals():
+      conn.close()
 
 #automate cache push to database
 def schedule_push(cache, db_path, interval_seconds = 7200):
   def loop():
     while True:
-      push_dnd_cache_to_db(cache, db_path)
+      try:
+        push_dnd_cache_to_db(cache, db_path)
+      except Exception as e:
+        logging.error(f"Scheduled push failed: {e}")
       time.sleep(interval_seconds)
   thread = threading.Thread(target = loop, daemon = True)
   thread.start()
+  logging.info(f"Started Scheduled cache push every {interval_seconds} seconds.")
+  
 #initialize connection to database
-def init_db():
+def init_db(db_path = db_path):
   conn = lite.connect(db_path)
   cursor = conn.cursor()
   cursor.execute("""
   CREATE TABLE IF NOT EXISTS users (
-    user_id TEXT PRIMARY KEY,
+    user_id INTEGER PRIMARY KEY,
     chars TEXT,
     n_chars INTEGER
   );
@@ -437,7 +488,7 @@ def init_db():
   cursor.execute("""
   CREATE TABLE IF NOT EXISTS dnd_characters (
     id INTEGER PRIMARY KEY,
-    owner TEXT,
+    owner INTEGER,
     name TEXT,
     race TEXT,
     background TEXT,
@@ -454,6 +505,7 @@ def init_db():
     exhaustion INTEGER,
     ms INTEGER -- move speed,
     notes TEXT -- JSON ["Note1", ...]
+    FOREIGN KEY (owner) REFERENCES users(user_id)
   );
   """)
   #For multiclass support
@@ -463,7 +515,6 @@ def init_db():
     class_name TEXT,
     level INTEGER,
     subclass TEXT,
-    hit_dice TEXT,
     PRIMARY KEY (character_id, class_name),
     FOREIGN KEY (character_id) REFERENCES dnd_characters(id) ON DELETE CASCADE
   );
@@ -500,25 +551,29 @@ def init_db():
 #Get the highest character ID from the table
 def update_max_id():
   global max_id
+  conn = None
   try:
     conn = lite.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT MAX(id) FROM dnd_characters")
     result = cursor.fetchone()
-    max_id = result[0] + 1 if result[0] is not None else 0
+    max_id = result[0] + 1 if result[0] is not None else 1
     logging.info(f"Max ID initialized to {max_id}")
   except Exception as e:
     logging.error(f"Error initializing max_id: {e}")
+    max_id = 1
   finally:
-    conn.close()
+    if conn:
+      conn.close()
 #Function to check tables for entries
 #This is necessary to populate the ID iterator correctly in runtime cache of characters
 def check_for_entries(table_name, db = db_path):
   #returns True if there are one or more entires, False otherwise
-  #Arguments: table_name - name of table to be queried
-  #db - file path to database
   #Return: bool: True if 1 or more entries, False otherwise
   conn = None
+  allowed_tables = {"dnd_characters", "users", "spells", "spell_slots", "proficiencies", "character_classes"}
+  if table_name not in allowed_tables:
+    raise ValueError("Invalid table name")
   try:
     conn = lite.connect(db)
     cursor = conn.cursor()
@@ -550,7 +605,7 @@ class ClassLevelModal(ui.Modal, title = "Add a Class"):
   class_name = ui.TextInput(label = "Class", placeholder = "eg. wizard", required = True)
   level = ui.TextInput(label = f"Level", placeholder = "eg. 1", required = True)
   def __init__(self, existing_classes):
-    super().__init__()
+    super().__init__(title = "Add a class", custom_id = "class_level_modal")
     self.existing_classes = existing_classes
     self.result = None
   async def on_submit(self, interaction: discord.Interaction):
@@ -566,12 +621,15 @@ class ClassLevelModal(ui.Modal, title = "Add a Class"):
     except ValueError:
       await interaction.response.send_message("Level must be a number between 1 and 20.", ephemeral = True)
       return
+    if cls in self.existing_classes:
+      await interaction.response.send_message(f"The class {cls} is already in your list. Each class can only be added once.", ephemeral = True)
+      return
     self.result = (cls, lvl)
-    await interaction.response.defer()
+    await interaction.response.send_message(f"Added {cls} at level {lvl}.", ephemeral = True)
 
 #Interactive view to loop until user done entering classes
 class ClassLoopView(ui.View):
-  def __init__(self, timeout = 300):
+  def __init__(self, timeout = 500):
     super().__init__(timeout = timeout)
     self.class_data = {}
     self.finished = False
@@ -580,36 +638,81 @@ class ClassLoopView(ui.View):
     await interaction.response.send_message(f"Please add a class from the following list of classes: {", ".join(class_dice)}", ephemeral = True)
     modal = ClassLevelModal(existing_classes = self.class_data)
     await interaction.response.send_modal(modal)
-    def check(i): return i.user == interaction.user and i.type.name == "modal_submit"
-    modal_interaction = await interaction.client.wait_for("interaction", check=check, timeout=300)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "class_level_modal"
+    try:
+      modal_interaction = await interaction.client.wait_for("interaction", check=check, timeout=300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Modal timed out.", ephemeral = True)
+      return
     if modal.result:
       cls, lvl = modal.result
       self.class_data[cls] = lvl
-      await interaction.response.send_message(f"Added: {cls.title()} (Level {lvl})", ephemeral = True)
-
-  @dicord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
   async def finish(self, interaction: discord.Interaction, button = ui.Button):
     if not self.class_data:
-      await interaction.response.send_message("Please add at least one class.", ephemeral = True)
+      await interaction.followup.send("Please add at least one class.", ephemeral = True)
       return
     self.finished = True
     self.stop()
     class_summary = "\n".join([f"{cls.title()} - Level {lvl}" for cls, lvl in self.class_data.items()])
-    await interaction.response.send_message(f"Final class breakdown:\n{class_summary}", ephemeral = True)
+    await interaction.followup.send(f"Final class breakdown:\n{class_summary}", ephemeral = True)
+
+class SubclassModal(ui.Modal, title = "Add Subclass"):
+  subclass = ui.TextInput(label = "Subclass Name", placeholder = "eg.; Circle of the Moon", required = True, max_length = 50)
+  def __init__(self, view):
+    super().__init__(title = "Add Subclass", timeout = 180, custom_id = "subclass_modal")
+    self.view = view
+    self.add_item(self.subclass)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.subclass.value.strip().lower()
+    if not name:
+      await interaction.response.send_message("Subclass name cannot be empty.", ephemeral = True)
+      return
+    self.view.subclass = name
+    await interaction.response.send_message(f"Added {name} as subclass.", ephemeral = True)
+
+class SubclassView(ui.View):
+  def __init__(self):
+    super().__init__(timeout = 300)
+    self.subclass = ""
+    self.finished = False
+  @discord.ui.button(label = "Add subclass", style = discord.ButtonStyle.primary)
+  async def add_subclass(self, interaction: discord.Interaction, button: ui.Button):
+    modal = SubclassModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "subclass_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Subclass entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if self.subclass == "":
+      await interaction.response.send_message("No subclass added.\nYour class level indicates you should have a subclass.\nAdd one later.", ephemeral = True)
+    else:
+      await interaction.response.send_message("Subclass entry complete.", ephemeral = True)
 
 class ProficiencyModal(ui.Modal, title = "Add Proficiency"):
   proficiency = ui.TextInput(label = "Proficiency name", placeholder = "eg.; str, athletics, thieves tools etc", required = True, max_length = 50)
   level = ui.TextInput(label = "Proficiency level (1 = Proficient, 2 = Expertise)", placeholder = "Enter 1 or 2", required = True, max_length = 1)
   def __init__(self, view):
-    super().__init__(timeout = 180)
+    super().__init__(title="Add Proficiency", timeout=180, custom_id="proficiency_modal")
     self.view = view
     self.add_item(self.proficiency)
     self.add_item(self.level)
   async def on_submit(self, interaction: discord.Interaction):
-    name = self.name_input.value.strip().lower()
-    level = self.level_input.value.strip()
+    name = self.proficiency.value.strip().lower()
+    level = self.level.value.strip()
     if level not in ("1", "2"):
       await interaction.response.send_message("Level must be 1 or 2. Please try again.", ephemeral = True)
+      return
+    if not name:
+      await interaction.response.send_message("Proficiency name cannot be empty", ephemeral = True)
+      return
+    if name in self.view.proficiencies:
+      await interaction.response.send_message(f"{name} already added.", ephemeral = True)
       return
     self.view.proficiencies[name] = int(level)
     await interaction.response.send_message(f"Added: {name} (Level {level})", ephemeral = True)
@@ -623,8 +726,11 @@ class ProficiencyView(ui.View):
   async def add_proficiency(self, interaction: discord.Interaction, button: ui.Button):
     modal = ProficiencyModal(view = self)
     await interaction.response.send_modal(modal)
-    def check(i): return i.user == interaction.user and i.type.name == "modal_submit"
-    await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "proficiency_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Proficiency entry timed out.", ephemeral = True)
   @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
   async def finish(self, interaction: discord.Interaction, button: ui.Button):
     self.finished = True
@@ -640,7 +746,7 @@ class SpellsModal(ui.Modal, title = "Add Spell"):
   spell = ui.TextInput(label = "Spell Name", placeholder = "eg.; fireball", required = True, max_length = 30)
   level = ui.TextInput(label = "Spell Level (cantrip or 1-9)", placeholder = "eg.; (cantrip) or (1)", required = True, max_length = 7)
   def __init__(self, view):
-    super().__init__()
+    super().__init__(title = "Add Spell", timeout = 180, custom_id = "spells_modal")
     self.view = view
     self.add_item(self.spell)
     self.add_item(self.level)
@@ -652,7 +758,7 @@ class SpellsModal(ui.Modal, title = "Add Spell"):
       await interaction.response.send_message("level must either be cantrip or a number 1-9. Please try again.", ephemeral = True)
       return
     self.view.spells[name] = level
-    await interaction.response.send_message(f"Added: {name} (Level {level})")
+    await interaction.response.send_message(f"Added: {name.title()} (Level {level})", ephemeral = True)
 
 class SpellsView(ui.View):
   def __init__(self):
@@ -663,6 +769,11 @@ class SpellsView(ui.View):
   async def add_spell(self, interaction: discord.Interaction, button: ui.Button):
     modal = SpellsModal(view = self)
     await interaction.response.send_modal(modal)
+    def check(i: discord.Interaction): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "spells_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Spell entry timed out.", ephemeral = True)
   @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
   async def finish(self, interaction: discord.Interaction, button: ui.Button):
     self.finished = True
@@ -674,7 +785,274 @@ class SpellsView(ui.View):
       await interaction.response.send_message(f"Added spells:\n{spells_summary}", ephemeral = True)
 
 class SpellSlotsModal(ui.Modal, title = "Add spell slots array"):
-  
+  level = ui.TextInput(label = "Slot level", placeholder = "eg.; 1", required = True, max_length = 1)
+  num = ui.TextInput(label = "Number of Slots for that level", placeholder = "eg.; 3", required = True, max_length = 2)
+  def __init__(self, view):
+    super().__init__(title = "Add spell slots array", timeout = 180, custom_id = "spellslots_modal")
+    self.view = view
+    self.add_item(self.level)
+    self.add_item(self.num)
+  async def on_submit(self, interaction: discord.Interaction):
+    level = self.level.value.strip()
+    try:
+      num = int(self.num.value.strip())
+    except ValueError:
+      await interaction.response.send_message("Number of slots must be a valid integer.", ephemeral = True)
+      return
+    approved = {str(i) for i in range(1,10)}
+    if level not in approved:
+      await interaction.response.send_message("level must be a number 1-9. Please try again.", ephemeral = True)
+      return
+    self.view.slots[level] = num
+    await interaction.response.send_message(f"Added {num} slots at level {level}", ephemeral = True)
+
+class SpellSlotsView(ui.View):
+  def __init__(self):
+    super().__init__(timeout = 300)
+    self.slots = {}
+    self.finished = False
+  @discord.ui.button(label = "Add spell slot level", style = discord.ButtonStyle.primary)
+  async def add_spell_slot(self, interaction: discord.Interaction, button: ui.Button):
+    modal = SpellSlotsModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "spellslots_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Spell slot entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.slots:
+      await interaction.response.send_message("No changes entered.", ephemeral = True)
+    else:
+      slots_summary = "\n".join([f"Level: {lvl} - Number: {num}" for lvl, num in sorted(self.slots.items(), key = lambda x: int(x[0]))])
+      await interaction.response.send_message(f"Changes summary:\n{slots_summary}", ephemeral = True)
+
+class FeatsModal(ui.Modal, title = "Add feats"):
+  feat = ui.TextInput(label = "Feat Name", placeholder = "eg.; Sharpshooter", max_length = 50)
+  def __init__(self, view):
+    super().__init__(title = "Add feat", timeout = 300, custom_id = "feats_modal")
+    self.view = view
+    self.add_item(self.feat)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.feat.value.strip()
+    self.view.feats.append(name)
+    await interaction.response.send_message(f"Added {name.title()} to list of feats.", ephemeral = True)
+
+class FeatsView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.feats = []
+    self.finished = False
+  @discord.ui.button(label = "Add a feat", style = discord.ButtonStyle.primary)
+  async def add_feat(self, interaction: discord.Interaction, button: ui.Button):
+    modal = FeatsModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "feats_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Feat entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.feats:
+      await interaction.response.send_message("No feats added at this time.", ephemeral = True)
+    else:
+      feats_summary = "\n".join(self.feats)
+      await interaction.response.send_message(f"Feats added summary:\n{feats_summary}", ephemeral = True)
+
+class EquipmentModal(ui.Modal, title = "Add equipment"):
+  equipment = ui.TextInput(label = "Item Name", placeholder = "eg.; Gold", max_length = 50)
+  num = ui.TextInput(label = "Number held", placeholder = "eg.; 500", max_length = 10)
+  def __init__(self, view):
+    super().__init__(title = "Add equipment", timeout = 300, custom_id = "equipment_modal")
+    self.view = view
+    self.add_item(self.equipment)
+    self.add_item(self.num)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.equipment.value.strip()
+    try:
+      num = int(self.num.value.strip())
+    except ValueError:
+      await interaction.response.send_message("Amount must be a valid integer.", ephemeral = True)
+      return
+    self.view.equipment[name] = num
+    await interaction.response.send_message(f"Item: {name.title()} - Amount: {num}", ephemeral = True)
+
+class EquipmentView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.equipment = {}
+    self.finished = False
+  @discord.ui.button(label = "Add an item", style = discord.ButtonStyle.primary)
+  async def add_item(self, interaction: discord.Interaction, button: ui.Button):
+    modal = EquipmentModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "equipment_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Equipment entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.equipment:
+      await interaction.response.send_message("No items or money added at this time.", ephemeral = True)
+    else:
+      items_summary = "\n".join([f"Item: {item} - Amount: {num}" for item, num in self.equipment.items()])
+      await interaction.response.send_message(f"Items added summary:\n{items_summary}", ephemeral = True)
+
+class AbilitiesModal(ui.Modal, title = "Add Abilities"):
+  ability = ui.TextInput(label = "Ability Name", placeholder = "eg.; Hunter's Mark", max_length = 50)
+  def __init__(self, view):
+    super().__init__(title = "Add Abilities", timeout = 300, custom_id = "abilities_modal")
+    self.view = view
+    self.add_item(self.ability)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.ability.value.strip()
+    self.view.abilities.append(name)
+    await interaction.response.send_message(f"Added {name.title()} to list of abilities.", ephemeral = True)
+
+class AbilitiesView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.abilities = []
+    self.finished = False
+  @discord.ui.button(label = "Add an ability", style = discord.ButtonStyle.primary)
+  async def add_ability(self, interaction: discord.Interaction, button: ui.Button):
+    modal = AbilitiesModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "abilities_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Ability entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.abilities:
+      await interaction.response.send_message("No abilities added at this time.", ephemeral = True)
+    else:
+      abilities_summary = "\n".join(self.abilities)
+      await interaction.response.send_message(f"Abilities added summary:\n{abilities_summary}", ephemeral = True)
+
+class PointsModal(ui.Modal, title = "Add expendable points"):
+  point = ui.TextInput(label = "Point Name", placeholder = "eg.; Sorcery Points or Bardic Inspiration", max_length = 50)
+  num = ui.TextInput(label = "Maximum number", placeholder = "eg.; 5", max_length = 3)
+  def __init__(self, view):
+    super().__init__(title = "Add expendable points", timeout = 300, custom_id = "points_modal")
+    self.view = view
+    self.add_item(self.point)
+    self.add_item(self.num)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.point.value.strip()
+    try:
+      num = int(self.num.value.strip())
+    except ValueError:
+      await interaction.response.send_message("Number must be a valid integer.", ephemeral = True)
+      return
+    self.view.points[name] = num
+    await interaction.response.send_message(f"Type: {name.title()} - Amount: {num}", ephemeral = True)
+
+class PointsView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.points = {}
+    self.finished = False
+  @discord.ui.button(label = "Add a point type", style = discord.ButtonStyle.primary)
+  async def add_point(self, interaction: discord.Interaction, button: ui.Button):
+    modal = PointsModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "points_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Point entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.points:
+      await interaction.response.send_message("No expendable points added at this time.", ephemeral = True)
+    else:
+      items_summary = "\n".join([f"Type: {item} - Max: {num}" for item, num in self.points.items()])
+      await interaction.response.send_message(f"Points added summary:\n{items_summary}", ephemeral = True)
+
+class LanguagesModal(ui.Modal, title = "Add Languages"):
+  language = ui.TextInput(label = "Language Name", placeholder = "eg.; Common", max_length = 50)
+  def __init__(self, view):
+    super().__init__(title = "Add Languages", timeout = 300, custom_id = "languages_modal")
+    self.view = view
+    self.add_item(self.language)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.language.value.strip()
+    self.view.languages.append(name)
+    await interaction.response.send_message(f"Added {name.title()} to list of languages.", ephemeral = True)
+
+class LanguagesView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.languages = []
+    self.finished = False
+  @discord.ui.button(label = "Add a language", style = discord.ButtonStyle.primary)
+  async def add_language(self, interaction: discord.Interaction, button: ui.Button):
+    modal = LanguagesModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "languages_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 300)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Language entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.languages:
+      await interaction.response.send_message("No languages added at this time.", ephemeral = True)
+    else:
+      summary = "\n".join(self.languages)
+      await interaction.response.send_message(f"Languages added summary:\n{summary}", ephemeral = True)
+
+class NotesModal(ui.Modal, title = "Add Notes"):
+  note = ui.TextInput(label = "Note", placeholder = "eg.; The shopkeeper hates us", max_length = 500)
+  def __init__(self, view):
+    super().__init__(title = "Add Notes", timeout = 500, custom_id = "notes_modal")
+    self.view = view
+    self.add_item(self.note)
+  async def on_submit(self, interaction: discord.Interaction):
+    name = self.note.value.strip()
+    self.view.notes.append(name)
+    await interaction.response.send_message(f"Added a note.\n{name}", ephemeral = True)
+
+class NotesView(ui.View):
+  def __init__(self):
+    super().__init(timeout = 300)
+    self.notes = []
+    self.finished = False
+  @discord.ui.button(label = "Add a note", style = discord.ButtonStyle.primary)
+  async def add_note(self, interaction: discord.Interaction, button: ui.Button):
+    modal = NotesModal(view = self)
+    await interaction.response.send_modal(modal)
+    def check(i): return i.user == interaction.user and i.type.name == "modal_submit" and i.data.get("custom_id") == "notes_modal"
+    try:
+      await interaction.client.wait_for("interaction", check = check, timeout = 500)
+    except asyncio.TimeoutError:
+      await interaction.followup.send("Note entry timed out.", ephemeral = True)
+  @discord.ui.button(label = "Finish", style = discord.ButtonStyle.success)
+  async def finish(self, interaction: discord.Interaction, button: ui.Button):
+    self.finished = True
+    self.stop()
+    if not self.notes:
+      await interaction.response.send_message("No notes added at this time.", ephemeral = True)
+    else:
+      summary = "\n".join(self.notes)
+      await interaction.response.send_message(f"Notes added summary:\n{summary}", ephemeral = True)
 
 async def machine_type_autocomplete(interaction: discord.Interaction, current: str):
   return [
@@ -686,16 +1064,17 @@ async def machine_type_autocomplete(interaction: discord.Interaction, current: s
 @bot.event
 async def on_ready():
   await bot.tree.sync()
-  init_db()
+  await init_db()
+  await init_max_id_from_db()
   print(f"Logged in as {bot.user}")
 
 #dice roller
 @bot.tree.command(name = 'roll', description = 'Roll some dice!')
-@app_commands.desccribe(dice = "Dice roll in ndm+x format (ie 1d6+2)")
+@app_commands.describe(dice = "Dice roll in ndm or ndm+x or ndm-x format (ie 1d6+2)")
 async def roll(interaction: discord.Interaction, dice: str = "1d6+0"):
-  match = re.fullmatch(r"(\d+)d(\d+)+(\d+)", dice)
+  match = re.fullmatch(r"(\d+)d(\d+)([+-]\d+)?", dice)
   if not match:
-    await interaction.response.send_message("Invalid format. Please use ndm+x like 2d6+0 or 1d20+3.", ephemeral = True)
+    await interaction.response.send_message("Invalid format. Please use ndm+x like 2d6+0 or 1d20-3.", ephemeral = True)
     return
   num, sides, mod = map(int, match.groups())
   if num < 1:
@@ -711,15 +1090,17 @@ async def roll(interaction: discord.Interaction, dice: str = "1d6+0"):
   total = sum(rolls) + mod
   roll_text = ", ".join(str(r) for r in rolls)
 
-  await interation.response.send_message(f"Rolling {num}d{sides}:\nResults: {roll_text}\n**Total: {total}**")
+  await interaction.response.send_message(f"Rolling {num}d{sides}:\nResults: {roll_text}\n**Total: {total}**")
 
 #enter a character that is already built elsewhere to the database
-@bot.tree.command(name = "add_character", description = "Add a character that you already have built to your account")
+@bot.tree.command(name = "add_character", description = "Add a character that you already have built to your account (Interactive)")
 @app_commands.describe(name = "Character Name",
                        race = "Character race",
                        max_hp = "Maximum HP",
                        current_hp = "Current HP",
                        ac = "Armor Class",
+                       ms = "Move Speed",
+                       xp = "Experience Points, (default 0 if not using xp)",
                        background = "Character background",
                        str_stat = "Strength ability score",
                        dex_stat = "Dexterity ability score",
@@ -733,6 +1114,8 @@ async def add_character(interaction: discord.Interaction,
                         max_hp: int,
                         current_hp: int,
                         ac: int,
+                        ms: int,
+                        xp: int = 0,
                         background: str,
                         str_stat: int,
                         dex_stat: int,
@@ -748,6 +1131,8 @@ async def add_character(interaction: discord.Interaction,
                                   "wis": wis_stat,
                                   "cha": cha_stat}
                           owner = interaction.user.id
+                          #set hp
+                          hp = [current_hp, max_hp]
                           #for iterative interactive command prompting checks
                           def check(m):
                             return m.author.id == interaction.user.id and m.channel == interaction.channel
@@ -756,11 +1141,12 @@ async def add_character(interaction: discord.Interaction,
                           await interaction.response.send_message("Let's add your character's classes.", ephemeral = True)
                           await interaction.followup.send(view = class_view, ephemeral = True)
                           await class_view.wait()
-                          if not view.class_data:
+                          subclasses = {}
+                          if not class_view.class_data:
                             await interaction.followup.send("No classes entered. Character creation cancelled.")
                             return
-                          if view.finished:
-                            classes = view.class_data
+                          if class_view.finished:
+                            classes = class_view.class_data
                             hit_dice = {}
                             for cls in classes:
                               die = class_dice[cls]
@@ -769,39 +1155,133 @@ async def add_character(interaction: discord.Interaction,
                               else:
                                 hit_dice[die][0] += classes[cls]
                                 hit_dice[die][1] += classes[cls]
+                              if classes[cls] >= subclass_levels[cls]:
+                                subclass_view = SubclassView()
+                                await interaction.followup.send(f"Your level in {cls.title()} indicates you should have a subclass.\nAdd it now.", ephemeral = True)
+                                await interaction.followup.send(view = subclass_view, ephemeral = True)
+                                await subclass_view.wait()
+                                if subclass_view.finished:
+                                  subclasses[cls] = subclass_view.subclass
                           #add proficiencies
+                          proficiencies = {}
                           prof_view = ProficiencyView()
                           await interaction.followup.send("Let's add your proficiencies, including saves, abilities, and items.", ephemeral = True)
                           await interaction.followup.send(view = prof_view, ephemeral = True)
                           await prof_view.wait()
-                          if view.finished:
-                            proficiencies = view.proficiencies
+                          if prof_view.finished:
+                            proficiencies = prof_view.proficiencies
                           #add known spells
                           spells_known = {}
                           spells_view = SpellsView()
                           await interaction.followup.send("Let's add your known spells.\nIf your class knows the whole list and only prepares spells, skip this step.\nSkip if you don't cast spells.", ephemeral = True)
                           await interaction.followup.send(view = spells_view, ephemeral = True)
-                          await view.wait()
-                          if view.finished and view.spells:
+                          await spells_view.wait()
+                          if spells_view.finished and spells_view.spells:
                             #need to flip dictionary from {spell: level} to {level: [spells]}
                             for spell, lvl in spells_view.spells.items():
-                              spells_known.setDefault(lvl, []).sppend(spell)
+                              spells_known.setdefault(lvl, []).append(spell)
                           #add prepared spells
                           spells_prepared = {}
                           prep_view = SpellsView()
                           await interaction.followup.send("Let's add your prepared spells.\nIf your class does not prepare spells, skip this step.\nSkip if you don't cast spells.", ephemeral = True)
                           await interaction.followup.send(view = prep_view, ephemeral = True)
                           await prep_view.wait()
-                          if view.finished:
-                            if view.spells:
-                              for spell, lvl in view.spells.items():
+                          if prep_view.finished:
+                            if prep_view.spells:
+                              for spell, lvl in prep_view.spells.items():
                                 if lvl not in spells_prepared:
                                   spells_prepared[lvl] = [spell]
                                 else:
-                                  spells_prepared[lvl.append(spell)
-                          
+                                  spells_prepared[lvl].append(spell)
+                          #Add spell slots
+                          spell_slots = {}
+                          slots_view = SpellSlotsView()
+                          await interaction.followup.send("Let's add your spell slots array.\nIf your character does not need spell slots, skip this step.", ephemeral = True)
+                          await interaction.followup.send(view = slots_view, ephemeral = True)
+                          await slots_view.wait()
+                          if slots_view.finished and slots_view.slots:
+                            for lvl, num in slots_view.slots.items():
+                              spell_slots[lvl] = [num, num]
+                          #add feats
+                          feats = []
+                          feats_view = FeatsView()
+                          await interaction.followup.send("Add any feats your character has.\nIf you don't have any feats, just select Finished.", ephemeral = True)
+                          await interaction.followup.send(view = feats_view, ephemeral = True)
+                          await feats_view.wait()
+                          if feats_view.finished and feats_view.feats:
+                            feats = feats_view.feats
+                          #add equipment, including gold/silver/etc
+                          equipment = {}
+                          equipment_view = EquipmentView()
+                          await interaction.followup.send("Add any money or equipment.", ephemeral = True)
+                          await interaction.followup.send(view = equipment_view, ephemeral = True)
+                          await equipment_view.wait()
+                          if equipment_view.finished and equipment_view.equipment:
+                            equipment = equipment_view.equipment
+                          #add abilities
+                          abilities = []
+                          abilities_view = AbilitiesView()
+                          await interaction.followup.send("Add any character abilities.", ephemeral = True)
+                          await interaction.followup.send(view = abilities_view, ephemeral = True)
+                          await abilities_view.wait()
+                          if abilities_view.finished and abilities_view.abilities:
+                            abilities = abilities_view.abilities
+                          #add expendable points like bardic inspiration or action surge
+                          points = {}
+                          points_view = PointsView()
+                          await interaction.followup.send("Add expendable points.\nExamples include Sorcery Points, Action Surge, and Bardic Inspiration.", ephemeral = True)
+                          await interaction.followup.send(view = points_view, ephemeral = True)
+                          await points_view.wait()
+                          if points_view.finished and points_view.points:
+                            points = points_view.points
+                          #Add languages known
+                          languages = []
+                          langs_view = LanguagesView()
+                          await interaction.followup.send("Add languages known.", ephemeral = True)
+                          await interaction.followup.send(view = langs_view, ephemeral = True)
+                          await langs_view.wait()
+                          if langs_view.finished and langs_view.languages:
+                            languages = langs_view.languages
+                          #add notes
+                          notes = []
+                          notes_view = NotesView()
+                          await interaction.followup.send("Add campaign or character notes.", ephemeral = True)
+                          await interaction.followup.send(view = notes_view, ephemeral = True)
+                          await notes_view.wait()
+                          if notes_view.finished and notes_view.notes:
+                            notes = notes_view.notes
+                          #Set exhaustion elvel to 0
+                          exhaustion = 0
                           #generate character id
                           char_id = get_next_id()
+                          #create dnd_character object
+                          character = DnD_Char(
+                            owner = owner,
+                            name = name,
+                            race = race,
+                            background = background,
+                            classes = classes,
+                            hit_dice = hit_dice,
+                            stats = stats,
+                            hp = hp,
+                            ac = ac,
+                            Id = char_id,
+                            xp = xp,
+                            subclasses = subclasses,
+                            abilities = abilities,
+                            notes = notes,
+                            spells = { "known": spells_known, "prepared": spells_prepared},
+                            spell_slots = spell_slots,
+                            points = points,
+                            ms = ms,
+                            languages = languages,
+                            equipment = equipment,
+                            feats = feats,
+                            exhaustion = exhaustion,
+                            proficiencies = proficiencies
+                          )
+                          
+                          
                           
                           
 #slot machine command (Needed for my campaign so I made it here)
