@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands, Interaction, ui
+from typing import List
 import random
 import ctypes
 import json
@@ -400,6 +401,95 @@ class DnD_Cache:
     with self.lock:
       return len(self.characters) == 0
 
+#a function to obtain the names and IDs of characters using a user_id from the database
+def get_characters_by_user(user_id: int):
+  #returns dict: {character_id: name,...}
+  conn = lite.connect(db_path)
+  conn.row_factory = lite.Row
+  cursor = conn.cursor()
+  #dictionary to store characters by id: name
+  characters = {}
+  #check if user appears in database and has 1 or more characters
+  cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+  user_row  = cursor.fetchone()
+  #return empty dictionary if no user entry present in database or user has no characters
+  if not user_row or user_row["n_chars"] == 0:
+    conn.close()
+    return {}
+  cursor.execute("SELECT id, name FROM dnd_characters WHERE owner = ?", (user_id,))
+  rows = cursor.fetchall()
+  for row in rows:
+    characters[row["id"]] = row["name"]
+  conn.close()
+  return characters
+
+#a function to pull characters from the database by character id
+def pull_character_from_db(char_id: int):
+  #Returns a DnD_Char object
+  #I don't use joins to optimize for presence/absense in relational tables
+  conn = lite.connect(db_path)
+  conn.row_factory = lite.Row
+  cursor = conn.cursor()
+  cursor.execute("SELECT * FROM dnd_characters where id = ?", (char_id,))
+  char = cursor.fetchone()
+  if not char:
+    conn.close()
+    return None
+  #to parse the json entries
+  get_json = lambda k: json.loads(char[k]) if char[k] else {}
+  get_list = lambda k: json.loads(char[k]) if char[k] else []
+  char_data = {
+    "Id": char['id'],
+    "owner": char["owner"],
+    "name": char["name"],
+    "race": char["race"],
+    "background": char["background"],
+    "hit_dice": get_json("hit_dice"),
+    "stats": get_json("stats"),
+    "hp": json.loads(char["hp"]) if char["hp"] else [0, 0], #gaurantees this will load correctly
+    "ac": char["ac"],
+    "xp": char["xp"],
+    "points": get_json("points"),
+    "languages": get_list("languages"),
+    "equipment": get_json("equipment"),
+    "feats": get_list("feats"),
+    "abilities": get_list("abilities"),
+    "notes": get_list("notes"),
+    "ms": char["ms"],
+    "exhaustion": char["exhaustion"]
+  }
+  #get class data
+  cursor.execute("SELECT class_name, level, subclass FROM character_classes WHERE character_id = ?", (char_id,))
+  rows = cursor.fetchall()
+  classes = {}
+  subclasses = {}
+  for row in rows:
+    cls = row["class_name"]
+    classes[cls] = row["level"]
+    if row["subclass"]:
+      subclasses[cls] = row["subclass"]
+  char_data["classes"] = classes
+  char_data["subclasses"] = subclasses
+  #get proficiencies
+  cursor.execute("SELECT proficiencies FROM proficiencies WHERE character_id = ?", (char_id,))
+  row = cursor.fetchone()
+  char_data["proficiencies"] = json.loads(row["proficiencies"]) if row else {}
+  #spells
+  cursor.execute("SELECT spells FROM spells WHERE character_id = ?", (char_id,))
+  row = cursor.fetchone()
+  spells = json.loads(row["spells"]) if row else {}
+  char_data["spells"] = {
+    "known": spells.get("known", {}),
+    "prepared": spells.get("prepared", {})
+  }
+  #Spell slots
+  cursor.execute("SELECT slots FROM spell_slots WHERE character_id = ?", (char_id,))
+  row = cursor.fetchone()
+  char_data["spell_slots"] = json.loads(row["slots"]) if row else {}
+  conn.close()
+  return DnD_Char(**char_data)
+
+#updates the user table, used whenever the cache pushes to database
 def update_users_table(cache: DnD_Cache, conn):
     cursor = conn.cursor()
     # Group characters by owner
@@ -432,7 +522,7 @@ def update_users_table(cache: DnD_Cache, conn):
       conn.commit()
 
 #pushing the dnd character cache to a database
-def push_dnd_cache_to_db(cache: DnD_Cache, db: str):
+def push_dnd_cache_to_db(cache: DnD_Cache, db: str = db_path):
   if cache.is_empty():
     logging.info("Character cache is empty. Skipping database push.")
     return
@@ -480,7 +570,7 @@ def init_db(db_path = db_path):
   cursor.execute("""
   CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    chars TEXT,
+    chars TEXT, -- JSON [char_id,...]
     n_chars INTEGER
   );
   """)
@@ -1054,6 +1144,62 @@ class NotesView(ui.View):
       summary = "\n".join(self.notes)
       await interaction.response.send_message(f"Notes added summary:\n{summary}", ephemeral = True)
 
+class CharacterDropdown(discord.ui.Select):
+  def __init__(self, characters, page, per_page):
+    self.characters = characters
+    self.page = page
+    self.per_page = per_page
+    options = self._build_options()
+    super().__init__(placeholder = "Choose a character", min_values = 1, max_values = 1, options = options)
+  def _build_options(self):
+    start = self.page * self.per_page
+    end = start + self.per_page
+    options = [discord.SelectOption(label = name, value = str(cid)) for cid, name in self.characters[start:end]]
+    if self.page > 0:
+      options.append(discord.SelectOption(label = "← Previous Page", value = "__prev__"))
+    if end < len(self.characters):
+      options.append(discord.SelectOption(label = "Next Page →", value = "__next__"))
+    return options
+  async def callback(self, interaction: discord.Interaction):
+    view: CharacterSelect = self.view
+    value = self.values[0]
+    if value == "__next__":
+      view.page += 1
+      await view.update_select(interaction)
+    elif value == "__prev__":
+      view.page -= 1
+      await view.update_select(interaction)
+    else:
+      view.selected_id = int(value)
+      view.stop()
+      await interaction.response.send_message(f"Character selected: ID {value}", ephemeral = True)
+        
+#a view to select a character from a menu
+class CharacterSelect(discord.ui.View):
+  def __init__(self, characters: dict[int, str], per_page = 10):
+    super().__init__(timeout = 300)
+    self.characters = list(characters.items())
+    self.page = 0
+    self.per_page = per_page
+    self.selected_id = None
+    self.cancelled = False
+    self.message = None
+    self.add_items()
+  def add_items(self):
+    self.clear_items()
+    self.add_item(CharacterDropdown(self.characters, self.page, self.per_page))
+    cancel_button = discord.ui.Button(label = "Cancel", style = discord.ButtonStyle.danger)
+    cancel_button.callback = self.cancel_callback
+    self.add_item(cancel_button)
+  async def update_select(self, interaction: discord.Interaction):
+    await interaction.response.defer()
+    self.add_items()
+    await interaction.edit_original_response(view = self)
+  async def cancel_callback(self, interaction: discord.Interaction):
+    self.cancelled = True
+    await interaction.response.send_message("Character selection cancelled.", ephemeral = True)
+    self.stop()
+
 async def machine_type_autocomplete(interaction: discord.Interaction, current: str):
   return [
     app_commands.Choice(name = mt, value = mt)
@@ -1280,9 +1426,29 @@ async def add_character(interaction: discord.Interaction,
                             exhaustion = exhaustion,
                             proficiencies = proficiencies
                           )
-                          
-                          
-                          
+                          dnd_chache[character.Id] = character
+
+#Command to load a character from database to the runtime: Required before calling any other commands on a character
+@bot.tree.command(name = 'load_character', description = "Load one or more saved characters")
+async def load_character(interaction: discord.Interaction):
+  user_id = interaction.user.id
+  await interaction.response.send_message("Checking for characters in your account...", ephemeral = True)
+  chars = get_characters_by_user(user_id)
+  if not chars:
+    await interaction.followup.send("You don't have any saved characters", ephemeral = True)
+    return
+  view = CharacterSelect(chars)
+  await interaction.followup.send("Choose character from the list to load.", ephemeral = True)
+  await view.wait()
+  if view.cancelled:
+    return
+  if view.selected_id is not None:
+    char = pull_character_from_db(view.selected_id)
+    dnd_cache[char.Id] = char
+    await interaction.followup.send(f"Character '{char.name}' (ID {char.Id}) loaded to runtime cache", ephemeral = True)
+
+#Command to update stats
+@bot.tree.command(name = 'stat_update', description = "Update D&D character stat scores")
                           
 #slot machine command (Needed for my campaign so I made it here)
 @bot.tree.command(name = 'slot', description = "Play a slot machine")
@@ -1307,7 +1473,7 @@ async def slot(interaction: discord.Interaction, machine_type: str = "basic", wa
     payout = result['payout']
     wager = result['wager']
 
-    await interaction.response.send_message(f"{symbols}\nWagered: {wager}\nWinnings Multiplier: {multiplier}\nPayout: {payout:.2f}")
+    await interaction.followup.send(f"{symbols}\nWagered: {wager}\nWinnings Multiplier: {multiplier}\nPayout: {payout:.2f}")
   except Exception as e:
     await interaction.response.send_message(f"Failed to parse result: {e}")
 
